@@ -18,6 +18,9 @@
 | `quality.go` | 信号质量三分类与缺失槽填充 |
 | `metrics.go` | 不跨越中断边界的派生指标聚合 |
 | `alert.go` | 基于连续时间窗的告警触发/恢复迟滞状态机 |
+| `episode.go` | 事件管理：一次持续异常 = 一次事件，跨中断不拆分 |
+| `silence.go` | 尾段静默填充与超上限截断结论 |
+| `snapshot.go` | 配置快照：结论固化产生时的换算参数与规则版本 |
 | `pipeline.go` | 串联全部阶段的并发安全编排器 |
 | `simulate.go` | 确定性本地数据生成器（乱序/重复/丢包/中断/伪迹/漂移） |
 | `cmd/demo` | 本地可运行的端到端演示 |
@@ -121,7 +124,69 @@ Active   ── 出现 QMissing / QArtifactUnusable ──► Inactive(强制恢
 两条路径产出的指标窗与告警事件**逐条相同**，断连重连后也收敛到同一状态，
 不出现重复告警或漏报（见 `TestOnlineEqualsReplay`）。
 
-## 4. 本地验证方法
+## 4. 事件管理：一次持续异常 = 一次完整事件
+
+`EpisodeRule`（按通道配置，可选）把一段持续异常归并为**一次事件**，用于值班与
+事后复盘，而不是每越限一次就报一条：
+
+- **开启**：首个越限槽开启事件，分配稳定编号（`通道#序号`，如 `HR#0001`）。
+  编号只取决于输入内容，同一批数据在线处理与离线重放得到相同编号。
+- **跨中断不拆分**：事件开启期间，设备摘下、伪迹遮挡或丢包造成的
+  `QMissing`/`QArtifactUnusable` 段被标记为 `SegUnavailable`
+  （**数据不可用、结论待定**）——既不是恢复正常，也不是事件结束；
+  重连后若仍越限，**同一事件继续**，不会产生新事件。
+- **结束条件**：只有**连续**正常满 `RecoverDuration` 事件才关闭
+  （`End` = 连续恢复满时长被确认的时刻）。不可用段会打断“连续正常”计时，
+  数据恢复后需重新连续计满——“没数据”不能冒充“已恢复”。
+- **可串联复盘**：`Pipeline.Episodes()` 返回事件档案（含 `Segments`：
+  异常 / 不可用待定 / 恢复观察 三段式时间线）；`Pipeline.EpisodeEvents()`
+  返回生命周期迁移记录（开启 / 进入不可用 / 数据恢复 / 结束），
+  每条都带 `EpisodeID`，可顺编号把一次事件从开始到结束串起来。
+- **在线 = 重放**：事件完全由质量判定流推导，而判定流只取决于设备时间与
+  序列号，因此在线逐包与历史重放产出的事件条数、编号、起止与片段逐条一致
+  （`TestEpisodeOnlineEqualsReplay`）。
+
+## 5. 会话收尾与尾段静默
+
+设备摘下放在一边、或一次采集结束不再上报后，`Advance(t)` 把时间往后推时：
+
+- **尾段不再“看起来一直正常”**：最后一个实际点之后、超过容差的时段按
+  `SlotStep` 补 `QMissing`（与流中间的空洞同一套语义）。效果：活跃告警会在
+  第一个静默槽被强制恢复，指标窗在最后实际点关闭，事件的尾段被标记为
+  “数据不可用、结论待定”。
+- **可配置上限 `Config.SilenceCap`**：
+  - `<= 0`：不设上限，推进到哪就补到哪；
+  - `> 0`：最多补到 `最后实际点 + SilenceCap`。超过上限时记录一条
+    `TailTruncation`（`Pipeline.Truncations()`）——明确写出最后数据时刻与
+    **截断发生位置**，之后不再向下补；同一静默段反复推进不会重复记录，
+    新数据到达后自动复位。
+- 上限改大改小，截断位置随之确定性地变化；相同配置重复运行结论逐条一致
+  （`TestSilenceCapConfigurable`）。
+
+## 6. 配置快照与新旧兼容
+
+每条可查询/导出的结论都固化**产生它时**的配置，以结构化字段输出
+（`ConfigSnapshot`，程序可直接读取，非人类可读文字）：
+
+| 结论 | 快照内容 |
+| --- | --- |
+| `AlertEvent.Snapshot` | 规则 ID/版本、高低限、TriggerN/RecoverN、通道 `Calibration` |
+| `Episode.Snapshot` / `EpisodeEvent.Snapshot` | 规则 ID/版本、高低限、RecoverDuration、通道 `Calibration` |
+| `MetricWindow.Cal` | 通道 `Calibration`（换算参数与量纲） |
+
+- 换算参数或规则改版后，**历史结论不被改写**（各自携带当时的快照）；
+  用旧版本配置对同一批历史数据重放，可逐条还原相同结论（含快照字段本身，
+  见 `TestConfigSnapshotPinnedAndReplay` 与 `TestRuleVersionReproducibility`）。
+- **兼容范围**：
+  - `EpisodeRules` 不配置 → 无事件输出，其余行为与旧版一致；
+  - `SilenceCap` 零值 → 不设上限；注意**尾段静默填充本身是新语义**：旧版
+    `Advance` 越过最后数据点不产生任何判定，新版会补 `QMissing`（会使活跃
+    告警强制恢复、指标窗在最后实际点关闭）。这是有意的语义修正——旧行为会
+    让“最后一段没数据”看起来“一直正常”；
+  - `AlertEvent.Snapshot`、`MetricWindow.Cal` 为纯新增字段，按字段名构造的
+    既有代码不受影响。
+
+## 7. 本地验证方法
 
 前置：Go 1.25+，无需任何外部服务或凭据。
 
@@ -154,6 +219,13 @@ go test -cover .
 | `TestOnlineEqualsReplay` | 在线 vs 重放逐条一致；两设备漂移、乱序、重复、丢包、断连重连；恰好 1 次触发 1 次恢复 |
 | `TestRuleVersionReproducibility` | 事件固化规则版本，历史结论可复现 |
 | `TestConcurrentIngestRace` | `-race` 并发安全；每个包处置总和守恒、无静默丢弃 |
+| `TestEpisodeDisconnectReconnectSameEpisode` | 断连重连仍是同一事件；不可用段标“结论待定”；连续正常满时长才结束；生命周期事件可按编号串联 |
+| `TestEpisodeUnavailableDoesNotCountAsRecovery` | 不可用段打断连续正常计时，恢复需重新计满 |
+| `TestEpisodeOnlineEqualsReplay` | 事件档案与生命周期事件在线 vs 重放逐条一致 |
+| `TestTailSilenceMarkedMissing` | 尾段静默被标成缺失：告警强制恢复、指标窗在最后实际点关闭、事件保持待定 |
+| `TestSilenceCapTruncation` | 静默超上限被截断：截断位置明确、再推进不重复不延伸 |
+| `TestSilenceCapConfigurable` | 上限可配置：改大改小截断位置随之确定变化，同配置重跑结论一致 |
+| `TestConfigSnapshotPinnedAndReplay` | 结论携带机器可读配置快照；改版不改写历史；旧版本重放逐条还原 |
 
 所有随机化均来自固定种子的确定性 LCG（仅用于制造固定的乱序与抖动），
 不读取时间或环境，测试可重复运行并得到字节级一致的结论。

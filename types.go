@@ -133,7 +133,7 @@ const (
 	AlertRecovering
 )
 
-// AlertEvent 是告警状态迁移事件，带规则版本以支持历史复现。
+// AlertEvent 是告警状态迁移事件，带规则版本与配置快照以支持历史复现。
 type AlertEvent struct {
 	RuleID      string
 	RuleVersion string
@@ -143,4 +143,6 @@ type AlertEvent struct {
 	To          AlertState
 	Value       float64
 	Reason      string
+	// Snapshot 固化产生该事件时生效的换算参数与规则参数（机器可读）。
+	Snapshot ConfigSnapshot
 }

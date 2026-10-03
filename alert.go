@@ -34,6 +34,7 @@ type AlertRule struct {
 // 所有事件带 RuleVersion：规则或配置版本变化后，用旧版本重放即可复现历史结论。
 type AlertEngine struct {
 	rule        AlertRule
+	snap        ConfigSnapshot
 	state       AlertState
 	breachRun   int
 	recoverRun  int
@@ -115,6 +116,10 @@ func (e *AlertEngine) RecoverAt(t time.Time) *AlertEvent {
 	return nil
 }
 
+// SetSnapshot 固化该引擎产生事件时使用的配置快照（换算参数+规则版本）。
+// 快照随每个事件输出，配置改版后历史事件仍携带当时版本，不被改写。
+func (e *AlertEngine) SetSnapshot(s ConfigSnapshot) { e.snap = s }
+
 func (e *AlertEngine) transition(to AlertState, t time.Time, reason string) *AlertEvent {
 	from := e.state
 	ev := &AlertEvent{
@@ -126,6 +131,7 @@ func (e *AlertEngine) transition(to AlertState, t time.Time, reason string) *Ale
 		To:          to,
 		Value:       e.lastValue,
 		Reason:      reason,
+		Snapshot:    e.snap,
 	}
 	e.state = to
 	if to == AlertActive {

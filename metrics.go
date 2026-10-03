@@ -16,6 +16,8 @@ type MetricWindow struct {
 	AbnormalCount int
 	// GapBefore 为该窗与上一个窗起点（或流起点）之间的中断间隔。
 	GapBefore time.Duration
+	// Cal 固化产生该窗时通道使用的换算参数（机器可读快照）。
+	Cal Calibration
 }
 
 type metricAcc struct {
