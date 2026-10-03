@@ -18,7 +18,8 @@
 | `quality.go` | 信号质量三分类与缺失槽填充 |
 | `metrics.go` | 不跨越中断边界的派生指标聚合 |
 | `alert.go` | 基于连续时间窗的告警触发/恢复迟滞状态机 |
-| `pipeline.go` | 串联全部阶段的并发安全编排器 |
+| `incident.go` | 持续异常事件（Incident）跟踪：稳定编号、阶段时间线 |
+| `pipeline.go` | 串联全部阶段的并发安全编排器（含尾段静默与配置快照） |
 | `simulate.go` | 确定性本地数据生成器（乱序/重复/丢包/中断/伪迹/漂移） |
 | `cmd/demo` | 本地可运行的端到端演示 |
 | `*_test.go` | 覆盖全部场景的确定性测试，日志含输入、依据、结论 |
@@ -121,7 +122,73 @@ Active   ── 出现 QMissing / QArtifactUnusable ──► Inactive(强制恢
 两条路径产出的指标窗与告警事件**逐条相同**，断连重连后也收敛到同一状态，
 不出现重复告警或漏报（见 `TestOnlineEqualsReplay`）。
 
-## 4. 本地验证方法
+## 4. 持续异常事件（Incident）管理
+
+`IncidentTracker` 把每个通道的质量判定流折叠成“事件”：一段持续异常从首次
+数值越限开始，到**连续正常满 `IncidentRecoverAfter`** 才结束，全程只占一条档案。
+
+- **稳定编号**：`INC-<channel>-<序号>`（如 `INC-HR-0001`），同一次异常全程不变，
+  事后可按编号把 `Timeline` 里的阶段迁移串起来。
+- **断连不结束事件**：事件进行中遇到 `QMissing` / `QArtifactUnusable`
+  （设备摘下、伪迹遮挡、丢包），进入 `PhaseUnavailable`——**数据不可用、结论待定**，
+  事件不关闭、不新增；数据恢复后若仍异常回到 `PhaseAbnormal`，若正常则进入
+  `PhaseRecovering` 重新计时。
+- **关闭条件**：只有连续正常满 `IncidentRecoverAfter`（`<=0` 表示首个正常槽即关闭）
+  才进入 `PhaseClosed`。中间任何异常或不可用都会打断恢复计时。
+- **在线 = 重放**：事件只由质量判定流决定，而判定流在在线逐包与历史重放下逐条一致，
+  因此两条路径产出的事件**条数、编号、时间线完全对齐**（`TestIncidentDisconnectReconnect`）。
+- 查询：`Pipeline.Incidents()` 返回全部事件档案（含进行中的），
+  `AdvanceFull` 返回的 `AdvanceResult.Incidents` 是本次推进产生的阶段迁移。
+
+```
+无事件  ── QValueAbnormal ──► ABNORMAL ── 缺失/不可用 ──► UNAVAILABLE(待定)
+ABNORMAL/UNAVAILABLE ── 正常 ──► RECOVERING ── 连续正常满 RecoverAfter ──► CLOSED
+RECOVERING ── 再次异常 ──► ABNORMAL        RECOVERING ── 不可用 ──► UNAVAILABLE
+```
+
+## 5. 会话收尾与尾段静默
+
+设备摘下放在一边、或一次采集结束后，**最后一条数据之后的时间不是“正常”**。
+开启 `MaxSilence`（>0）后，每次 `Advance` 都会对“最后实际点之后没有数据”的通道
+按 `SlotStep` 补 `QMissing` 判定：
+
+- **有界**：任一静默跨度（点间空洞或尾段）最多补 `MaxSilence` 时长；
+  静默超过上限时，在“静默起点 + MaxSilence”处打一条 `Truncated=true` 的
+  截断标记槽（机器可读，位置即截断点），之后的静默不再逐槽展开，结论待定。
+- **幂等**：重复推进同一时间段不会产生重复判定（按 through 水位去重），
+  在线逐步推进与一次性重放的结论一致。
+- **可配置、可复现**：`MaxSilence` 由使用方按场景设定；同一配置重跑结论逐位一致
+  （`TestSilenceCapConfigurable`）。`MaxSilence=0` 关闭该语义，行为与旧版完全一致。
+- 截断后事件仍开着的一律停在 `PhaseUnavailable`（结论待定），不会被误判为已恢复。
+
+> 调用约束（在线路径）：`Advance` 的 cutoff 不应越过“已见最大统一时间 - MaxDelay”
+> 这一安全水位。越过水位推进会让后到但合法的包被水位判定丢弃——这与迟到拒绝
+> 是同一类流式固有语义，按水位推进即可避免。
+
+## 6. 配置快照与版本兼容
+
+每条可查询/导出的结论都携带**机器可读**的 `ConfigSnapshot`（不是文字说明）：
+
+| 结论类型 | 快照位置 |
+| --- | --- |
+| `QualityVerdict` | `Snapshot`（含截断标记槽） |
+| `MetricWindow` | `Snapshot` |
+| `AlertEvent` | `RuleVersion` + `Snapshot` |
+| `Incident` | `Snapshot`（事件开启时固化） |
+
+`ConfigSnapshot` 含：`ConfigVersion`（`Config.Version`）、该通道当时生效的
+`Cal`（Scale/Offset/Unit）、`QualityRuleVersion`（`QualityRule.Version`）、
+以及该通道全部告警规则的 `ID -> Version` 映射。
+
+- **历史结论不被改写**：快照在建管线时固化；之后改换算参数或规则版本，
+  已产出的结论仍指向旧版本。
+- **旧版本可复现**：用旧版本配置对同一批原始数据重放，可逐条还原相同结论
+  （判定、告警事件、指标窗、事件档案），见 `TestConfigSnapshotPinnedAndReplay`。
+- **兼容范围**：新增字段（`Version`/`MaxSilence`/`IncidentRecoverAfter`/
+  `QualityRule.Version`）均为可选；不设置时行为与旧版逐位一致
+  （`MaxSilence=0` 不补尾段、快照版本字段为空串）。旧配置不需要迁移。
+
+## 7. 本地验证方法
 
 前置：Go 1.25+，无需任何外部服务或凭据。
 
@@ -154,6 +221,12 @@ go test -cover .
 | `TestOnlineEqualsReplay` | 在线 vs 重放逐条一致；两设备漂移、乱序、重复、丢包、断连重连；恰好 1 次触发 1 次恢复 |
 | `TestRuleVersionReproducibility` | 事件固化规则版本，历史结论可复现 |
 | `TestConcurrentIngestRace` | `-race` 并发安全；每个包处置总和守恒、无静默丢弃 |
+| `TestIncidentDisconnectReconnect` | 断连重连不拆事件：编号稳定、不可用段待定、连续正常才关闭；在线=重放 |
+| `TestTailSilenceVisibleAndTruncated` | 尾段静默显式标缺失、超上限截断、重复推进幂等 |
+| `TestSilenceCapConfigurable` | 上限可配置（5s/15s/0），结论各自稳定可复现 |
+| `TestIncidentPendingWhenDeviceRemoved` | 异常中设备摘下：事件不关闭、停在最末待定阶段、可见截断位置 |
+| `TestConfigSnapshotPinnedAndReplay` | 结论固化换算参数与规则版本；改版不改写历史；旧版重放逐条还原 |
+| `TestConcurrentNewPathsRace` | `-race` 下并发 AdvanceFull/Incidents/Events 无竞争，结论与串行一致 |
 
 所有随机化均来自固定种子的确定性 LCG（仅用于制造固定的乱序与抖动），
 不读取时间或环境，测试可重复运行并得到字节级一致的结论。

@@ -24,6 +24,7 @@ func main() {
 	}
 
 	cfg := pipeline.Config{
+		Version:  "demo-2026-10-v1", // 配置版本：随每条结论固化进快照
 		Epoch:    start,
 		Channels: specs,
 		Clocks: map[pipeline.DeviceID]pipeline.ClockParams{
@@ -42,14 +43,19 @@ func main() {
 			{ID: "hr-high", Version: "2026-09-v1", Channel: hr, HighEnabled: true, HighThreshold: 120, TriggerN: 3, RecoverN: 3},
 			{ID: "spo2-low", Version: "2026-09-v1", Channel: spo2, LowEnabled: true, LowThreshold: 92, TriggerN: 3, RecoverN: 2},
 		},
+		// 静默上限：尾段/空洞最多补 8s 缺失槽，超出打截断标记（结论待定）。
+		MaxSilence: 8 * sec,
+		// 事件关闭条件：连续正常满 3s。
+		IncidentRecoverAfter: 3 * sec,
 	}
 	p := pipeline.NewPipeline(cfg)
 
 	genHR := func(ch pipeline.ChannelID, seq int64, t time.Time) (float64, pipeline.RawFlag) {
-		// 第 8~12 秒心率飙到 130（连续越限触发告警），其余约 75；第 16 秒一个抖动尖峰。
+		// 第 8~12 秒心率飙到 240（超生理可信上限 220：数值异常，开启事件），
+		// 其余约 75；第 16 秒一个抖动尖峰。
 		v := 75.0
 		if seq >= 8 && seq <= 12 {
-			v = 130
+			v = 240
 		}
 		if seq == 16 {
 			v = 150
@@ -104,8 +110,20 @@ func main() {
 	fmt.Printf("accepted=%d duplicate=%d lateRejected=%d otherRejected=%d\n", accepted, dup, late, rejected)
 
 	end := start.Add(40 * sec)
-	windows, events := p.Advance(end)
+	res := p.AdvanceFull(end)
+	windows, events := res.Windows, res.Events
 	windows = append(windows, p.Flush()...)
+
+	var truncated []pipeline.QualityVerdict
+	for _, v := range res.Verdicts {
+		if v.Truncated {
+			truncated = append(truncated, v)
+		}
+	}
+	fmt.Printf("\ntail silence: %d verdicts evaluated, %d truncation marker(s)\n", len(res.Verdicts), len(truncated))
+	for _, v := range truncated {
+		fmt.Printf("  TRUNCATED ch=%s at %s (%s)\n", v.Channel, v.Time.Format("15:04:05"), v.Reasons[0])
+	}
 	fmt.Printf("\nmetric windows (gaps split windows): %d\n", len(windows))
 	for _, w := range windows {
 		fmt.Printf("  ch=%-11s [%s .. %s] n=%d mean=%.1f min=%.0f max=%.0f abnormal=%d gapBefore=%s\n",
@@ -114,9 +132,37 @@ func main() {
 	}
 	fmt.Printf("\nalert events: %d\n", len(events))
 	for _, e := range events {
-		fmt.Printf("  %s@%s %s->%s value=%.0f rule=%s (%s)\n",
-			e.RuleID, e.Time.Format("15:04:05"), stateName(e.From), stateName(e.To), e.Value, e.RuleVersion, e.Reason)
+		fmt.Printf("  %s@%s %s->%s value=%.0f rule=%s (%s) [snapshot cfg=%s scale=%.0f]\n",
+			e.RuleID, e.Time.Format("15:04:05"), stateName(e.From), stateName(e.To), e.Value, e.RuleVersion, e.Reason,
+			e.Snapshot.ConfigVersion, e.Snapshot.Cal.Scale)
 	}
+
+	fmt.Printf("\nincidents (stable IDs for duty review): %d\n", len(p.Incidents()))
+	for _, inc := range p.Incidents() {
+		state := "OPEN(pending)"
+		if inc.Closed {
+			state = "CLOSED at " + inc.End.Format("15:04:05")
+		}
+		fmt.Printf("  %s ch=%s start=%s %s snapshot.cfg=%s\n",
+			inc.ID, inc.Channel, inc.Start.Format("15:04:05"), state, inc.Snapshot.ConfigVersion)
+		for _, tr := range inc.Timeline {
+			fmt.Printf("    %s -> %s (%s)\n", tr.Time.Format("15:04:05"), phaseName(tr.To), tr.Reason)
+		}
+	}
+}
+
+func phaseName(ph pipeline.IncidentPhase) string {
+	switch ph {
+	case pipeline.PhaseAbnormal:
+		return "ABNORMAL"
+	case pipeline.PhaseUnavailable:
+		return "UNAVAILABLE(pending)"
+	case pipeline.PhaseRecovering:
+		return "RECOVERING"
+	case pipeline.PhaseClosed:
+		return "CLOSED"
+	}
+	return "?"
 }
 
 func stateName(s pipeline.AlertState) string {

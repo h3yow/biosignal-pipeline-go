@@ -117,6 +117,24 @@ type QualityVerdict struct {
 	Present bool
 	Value   float64
 	Unit    Unit
+	// Truncated 为 true 表示该槽是“静默超上限截断”标记：
+	// 此槽之后的数据不可用状态不再逐槽展开，结论待定。
+	Truncated bool
+	// Snapshot 固化产出该判定时的换算参数与规则版本（机器可读）。
+	Snapshot ConfigSnapshot
+}
+
+// ConfigSnapshot 记录一条结论产出时所生效的配置，机器可读，
+// 使历史结论在配置改版后仍可被追溯、且可用旧版本配置重放复现。
+type ConfigSnapshot struct {
+	// ConfigVersion 为整套配置的版本标识（Config.Version）。
+	ConfigVersion string
+	// Cal 为该通道当时生效的换算参数（physical = raw*Scale + Offset）。
+	Cal Calibration
+	// QualityRuleVersion 为当时生效的质量规则版本（QualityRule.Version）。
+	QualityRuleVersion string
+	// AlertRules 为当时生效的告警规则 ID -> 版本 的映射。
+	AlertRules map[string]string
 }
 
 // AlertState 是告警状态机的四态。
@@ -133,7 +151,7 @@ const (
 	AlertRecovering
 )
 
-// AlertEvent 是告警状态迁移事件，带规则版本以支持历史复现。
+// AlertEvent 是告警状态迁移事件，带规则版本与配置快照以支持历史复现。
 type AlertEvent struct {
 	RuleID      string
 	RuleVersion string
@@ -143,4 +161,6 @@ type AlertEvent struct {
 	To          AlertState
 	Value       float64
 	Reason      string
+	// Snapshot 固化产出该事件时的换算参数与全部规则版本（机器可读）。
+	Snapshot ConfigSnapshot
 }

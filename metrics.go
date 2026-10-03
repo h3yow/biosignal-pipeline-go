@@ -1,6 +1,9 @@
 package pipeline
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // MetricWindow 是一个连续、未跨越中断边界的有效数据窗。
 type MetricWindow struct {
@@ -16,6 +19,8 @@ type MetricWindow struct {
 	AbnormalCount int
 	// GapBefore 为该窗与上一个窗起点（或流起点）之间的中断间隔。
 	GapBefore time.Duration
+	// Snapshot 固化产出该窗时的换算参数与规则版本（机器可读）。
+	Snapshot ConfigSnapshot
 }
 
 type metricAcc struct {
@@ -97,6 +102,7 @@ func (a *MetricAggregator) Append(v QualityVerdict) *MetricWindow {
 }
 
 // Flush 关闭并返回指定通道（空字符串表示全部通道）尚未关闭的窗。
+// 全量 Flush 按通道字典序输出，保证多次运行结果逐位一致。
 func (a *MetricAggregator) Flush(channel ChannelID) []MetricWindow {
 	var out []MetricWindow
 	if channel != "" {
@@ -107,8 +113,13 @@ func (a *MetricAggregator) Flush(channel ChannelID) []MetricWindow {
 		}
 		return out
 	}
-	for _, m := range a.acc {
-		if w := m.close(); w != nil {
+	channels := make([]ChannelID, 0, len(a.acc))
+	for ch := range a.acc {
+		channels = append(channels, ch)
+	}
+	sort.Slice(channels, func(i, j int) bool { return channels[i] < channels[j] })
+	for _, ch := range channels {
+		if w := a.acc[ch].close(); w != nil {
 			out = append(out, *w)
 		}
 	}
