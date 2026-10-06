@@ -15,11 +15,11 @@
 | `types.go` | 核心类型：原始包、校准、时钟参数、对齐点、质量分类、告警状态/事件 |
 | `timesync.go` | 设备时钟 → 统一时间轴映射（固定偏移 + 线性漂移） |
 | `reorder.go` | 乱序重排、序列号去重、迟到拒绝、校准换算 |
-| `quality.go` | 信号质量三分类与缺失槽填充 |
-| `metrics.go` | 不跨越中断边界的派生指标聚合 |
+| `quality.go` | 信号质量三分类与缺失槽填充（受静默上限约束） |
+| `metrics.go` | 不跨越中断边界的派生指标聚合（结论带配置快照） |
 | `alert.go` | 基于连续时间窗的告警触发/恢复迟滞状态机 |
 | `episode.go` | 事件管理：一次持续异常 = 一次事件，跨中断不拆分 |
-| `silence.go` | 尾段静默填充与超上限截断结论 |
+| `silence.go` | 中间空洞与尾段静默的统一填充上限与截断结论 |
 | `snapshot.go` | 配置快照：结论固化产生时的换算参数与规则版本 |
 | `pipeline.go` | 串联全部阶段的并发安全编排器 |
 | `simulate.go` | 确定性本地数据生成器（乱序/重复/丢包/中断/伪迹/漂移） |
@@ -146,22 +146,43 @@ Active   ── 出现 QMissing / QArtifactUnusable ──► Inactive(强制恢
   序列号，因此在线逐包与历史重放产出的事件条数、编号、起止与片段逐条一致
   （`TestEpisodeOnlineEqualsReplay`）。
 
-## 5. 会话收尾与尾段静默
+## 5. 长静默：中间断连空洞与采集尾段，同一个上限
 
-设备摘下放在一边、或一次采集结束不再上报后，`Advance(t)` 把时间往后推时：
+设备**中途摘下/丢包很久后又连回**，与**一次采集彻底结束**，都会产生一段长时间
+没有数据的静默。两类静默在本管线中受**完全相同**的处理与**同一个上限**约束，
+区别只在于截断结论定位的是哪个通道、哪一段数据：
 
-- **尾段不再“看起来一直正常”**：最后一个实际点之后、超过容差的时段按
-  `SlotStep` 补 `QMissing`（与流中间的空洞同一套语义）。效果：活跃告警会在
-  第一个静默槽被强制恢复，指标窗在最后实际点关闭，事件的尾段被标记为
+- **静默一律补缺失、但绝不无限补**：超过 `ExpectedInterval + GapTolerance` 的静默
+  按 `SlotStep` 补 `QMissing`；缺失填充最多补到 `最后实际点 + SilenceCap`
+  （截断点那一槽仍补一条“此处已无数据”），截断点之后的时间轴**不再补点**。
+  因此即使断连几小时，也不会按原采样密度补出成千上万个点——耗时与内存只随
+  上限线性增长，不随空洞跨度增长。
+- **超过上限必有明确结论**：只要某段静默跨度超过生效上限，就记录一条
+  `SilenceTruncation`（`Pipeline.Truncations()`），明确给出**通道、最后实际数据
+  时刻 `LastDataTime`、截断发生位置 `TruncatedAt = LastDataTime + SilenceCap`**，
+  以及人类可读原因与机器可读配置快照。同一段静默只记录一次，反复推进不会重复。
+- **两类静默结论字段一致**：中途空洞（重连后得出）与尾段（`Advance(t)` 把时间推到
+  最后数据点之后得出）产出的 `SilenceTruncation` 只描述数据本身（最后实际点与截断
+  位置），不依赖“之后是否又连回来”。这保证了**在线逐包**（空洞期间先按尾段补到
+  水位、重连后收尾）与**把同一批数据一次性重放**（直接在两点间补空洞）对同一段
+  静默产出**逐字段相同**的一条结论。
+- **尾段不再“看起来一直正常”**：最后一个实际点之后补的 `QMissing` 会让活跃告警在
+  第一个静默槽被强制恢复、指标窗在最后实际点关闭、事件尾段标记为
   “数据不可用、结论待定”。
-- **可配置上限 `Config.SilenceCap`**：
-  - `<= 0`：不设上限，推进到哪就补到哪；
-  - `> 0`：最多补到 `最后实际点 + SilenceCap`。超过上限时记录一条
-    `TailTruncation`（`Pipeline.Truncations()`）——明确写出最后数据时刻与
-    **截断发生位置**，之后不再向下补；同一静默段反复推进不会重复记录，
-    新数据到达后自动复位。
-- 上限改大改小，截断位置随之确定性地变化；相同配置重复运行结论逐条一致
-  （`TestSilenceCapConfigurable`）。
+
+### 5.1 上限的确定、稳定与可复现
+
+- **改大改小，截断位置确定性地随之移动**：`TruncatedAt` 严格等于
+  `LastDataTime + 生效 SilenceCap`（`TestCapDeterministicAcrossValues` 验证单调性）。
+- **相同上限重复跑，逐条一致**：事件、指标窗、截断结论（含快照）在重复运行、
+  在线处理与批量重放之间逐条对得上（`TestMiddleGapOnlineEqualsReplay`、
+  `TestUnconfiguredCapIsBoundedAndReproducible`）。
+- **未配置也必须有明确、有限的边界**：`Config.SilenceCap` 为零或任意非正值时，
+  生效值为内建常量 `DefaultSilenceCap`（2 分钟），**绝不退化为“不设边界、一路补
+  下去还不给结论”**。生效值可通过 `Pipeline.EffectiveSilenceCap()` 查询，并被
+  固化进每条结论的快照。
+- 截断策略有自己的身份与版本：`SilenceRuleID = "builtin.silence-truncation"`、
+  `SilenceRuleVersion = "v1"`，随截断结论快照输出，可按版本重放。
 
 ## 6. 配置快照与新旧兼容
 
@@ -170,21 +191,32 @@ Active   ── 出现 QMissing / QArtifactUnusable ──► Inactive(强制恢
 
 | 结论 | 快照内容 |
 | --- | --- |
-| `AlertEvent.Snapshot` | 规则 ID/版本、高低限、TriggerN/RecoverN、通道 `Calibration` |
-| `Episode.Snapshot` / `EpisodeEvent.Snapshot` | 规则 ID/版本、高低限、RecoverDuration、通道 `Calibration` |
-| `MetricWindow.Cal` | 通道 `Calibration`（换算参数与量纲） |
+| `AlertEvent.Snapshot` | 规则 ID/版本、高低限、TriggerN/RecoverN、质量参数、槽步长、静默上限、通道 `Calibration` |
+| `Episode.Snapshot` / `EpisodeEvent.Snapshot` | 规则 ID/版本、高低限、RecoverDuration、质量参数、槽步长、静默上限、通道 `Calibration` |
+| `MetricWindow.Snapshot` | 质量规则 ID/版本、期望间隔/容差、生理范围 `PhysMin/PhysMax`、槽步长、静默上限、通道 `Calibration`（旧字段 `MetricWindow.Cal` 保留） |
+| `SilenceTruncation.Snapshot` | 截断策略 ID（`builtin.silence-truncation`）/版本、质量参数、槽步长、**当时生效的静默上限**、通道 `Calibration` |
+
+即每条结论都能直接取到三类信息：**换算参数**（`Cal` 的 Scale/Offset/Unit）、
+**判定用到的规则身份与版本**（`RuleID/RuleVersion`）、**当时的上限值**
+（`SilenceCap`），另含槽步长与质量阈值。质量规则 `QualityRule` 新增可选的
+`ID/Version` 字段，未配置时为空串，不影响判定。
 
 - 换算参数或规则改版后，**历史结论不被改写**（各自携带当时的快照）；
-  用旧版本配置对同一批历史数据重放，可逐条还原相同结论（含快照字段本身，
-  见 `TestConfigSnapshotPinnedAndReplay` 与 `TestRuleVersionReproducibility`）。
+  用旧版本配置（含当时的 `SilenceCap`）对同一批历史数据重放，可逐条还原相同
+  结论（含快照字段本身，见 `TestConfigChangeDoesNotRewriteHistory`、
+  `TestConfigSnapshotPinnedAndReplay`、`TestRuleVersionReproducibility`）。
 - **兼容范围**：
   - `EpisodeRules` 不配置 → 无事件输出，其余行为与旧版一致；
-  - `SilenceCap` 零值 → 不设上限；注意**尾段静默填充本身是新语义**：旧版
-    `Advance` 越过最后数据点不产生任何判定，新版会补 `QMissing`（会使活跃
-    告警强制恢复、指标窗在最后实际点关闭）。这是有意的语义修正——旧行为会
-    让“最后一段没数据”看起来“一直正常”；
-  - `AlertEvent.Snapshot`、`MetricWindow.Cal` 为纯新增字段，按字段名构造的
-    既有代码不受影响。
+  - `SilenceCap` 零值语义变更：**旧版是“不设上限、一路补下去”，新版一律回退到
+    有限默认值 `DefaultSilenceCap`（2 分钟）并在超限时给出截断结论**。这是有意的
+    语义收紧——长静默必须有明确、有限、可复现的边界，不允许无限填充；
+  - 尾段静默填充本身（`Advance` 越过最后数据点会补 `QMissing`，使活跃告警强制
+    恢复、指标窗在最后实际点关闭）相较最初版本即为新语义，继续保留；
+  - `TailTruncation` 现是 `SilenceTruncation` 的**类型别名**（字段去掉了
+    `Kind`，新增 `Snapshot`），按旧类型名与字段（Channel/LastDataTime/
+    TruncatedAt/Reason）构造/读取的既有代码无需改动；
+  - `AlertEvent.Snapshot`、`MetricWindow.Cal`、`QualityRule.ID/Version`、
+    `MetricWindow.Snapshot` 均为纯新增字段，按字段名构造的既有代码不受影响。
 
 ## 7. 本地验证方法
 
@@ -223,8 +255,16 @@ go test -cover .
 | `TestEpisodeUnavailableDoesNotCountAsRecovery` | 不可用段打断连续正常计时，恢复需重新计满 |
 | `TestEpisodeOnlineEqualsReplay` | 事件档案与生命周期事件在线 vs 重放逐条一致 |
 | `TestTailSilenceMarkedMissing` | 尾段静默被标成缺失：告警强制恢复、指标窗在最后实际点关闭、事件保持待定 |
-| `TestSilenceCapTruncation` | 静默超上限被截断：截断位置明确、再推进不重复不延伸 |
-| `TestSilenceCapConfigurable` | 上限可配置：改大改小截断位置随之确定变化，同配置重跑结论一致 |
+| `TestSilenceCapTruncation` | 尾段静默超上限被截断：截断位置明确、再推进不重复不延伸 |
+| `TestSilenceCapConfigurable` | 上限改大改小截断位置随之确定变化；未配置/负值回退有限默认上限；同配置重跑一致 |
+| `TestMiddleGapCappedLikeTail` | **中途长时间断连空洞与尾段受同一上限**：补到最后点+cap 即止，悬空段无补点/指标窗，截断结论定位精确且带快照 |
+| `TestMiddleGapOnlineEqualsReplay` | **中途长断连数据：在线逐包与批量重放的截断结论/告警事件/指标窗/事件逐条一致** |
+| `TestTailAndMiddleBothCapped` | 一条流内中间空洞与采集尾段各自截断，位置明确不混淆 |
+| `TestUnconfiguredCapIsBoundedAndReproducible` | **未配置上限不退化为无限补点**：回退 `DefaultSilenceCap`，重复运行逐条一致 |
+| `TestCapDeterministicAcrossValues` | 截断位置随上限单调、确定性移动；同上限重放结论逐条一致 |
+| `TestSilenceCapConcurrentRace` | 长空洞管线在 `-race` 并发下：计数守恒、无静默丢弃、截断结论结构与快照完整 |
+| `TestAllConclusionsCarrySnapshot` | 告警事件/事件/生命周期迁移/指标窗/截断结论全部带换算参数+规则身份版本+上限值 |
+| `TestConfigChangeDoesNotRewriteHistory` | **换算参数/规则/上限改版不改写历史；用当时版本（含当时 cap）重放逐条还原** |
 | `TestConfigSnapshotPinnedAndReplay` | 结论携带机器可读配置快照；改版不改写历史；旧版本重放逐条还原 |
 
 所有随机化均来自固定种子的确定性 LCG（仅用于制造固定的乱序与抖动），

@@ -22,7 +22,9 @@ func epVerdict(ch ChannelID, t time.Time, class QualityClass, v float64) Quality
 // 只有连续正常满 RecoverDuration 才结束。
 func TestEpisodeDisconnectReconnectSameEpisode(t *testing.T) {
 	base := time.Date(2026, 9, 24, 9, 0, 0, 0, time.UTC)
-	tr := NewEpisodeTracker(epRule(), snapshotFromEpisodeRule(epRule(), Calibration{Scale: 1, Unit: "bpm"}))
+	tr := NewEpisodeTracker(epRule(), snapshotFromEpisodeRule(epRule(), qualityContext{
+		cal: Calibration{Scale: 1, Unit: "bpm"}, slotStep: time.Second, silenceCap: DefaultSilenceCap,
+	}))
 
 	// 时间线（1s 槽）：
 	//   t0..t2   越限 130            -> 事件开启

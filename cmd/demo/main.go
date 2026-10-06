@@ -34,9 +34,13 @@ func main() {
 		},
 		MaxDelay: 3 * sec,
 		SlotStep: sec,
+		// 所有静默（中途断连空洞与采集尾段）缺失填充的统一上限：
+		// 超过即截断并记录明确结论；留空(0)则使用内建默认值 pipeline.DefaultSilenceCap。
+		// 这里取 6s：HR 在第 15 秒起断连 6s 的空洞、以及第 24 秒后的尾段都会触发截断。
+		SilenceCap: 6 * sec,
 		Quality: []pipeline.QualityRule{
-			{Channel: hr, ExpectedInterval: sec, GapTolerance: 300 * time.Millisecond, PhysMin: 30, PhysMax: 220},
-			{Channel: spo2, ExpectedInterval: sec, GapTolerance: 300 * time.Millisecond, PhysMin: 50, PhysMax: 100},
+			{ID: "hr-quality", Version: "2026-09-v1", Channel: hr, ExpectedInterval: sec, GapTolerance: 300 * time.Millisecond, PhysMin: 30, PhysMax: 220},
+			{ID: "spo2-quality", Version: "2026-09-v1", Channel: spo2, ExpectedInterval: sec, GapTolerance: 300 * time.Millisecond, PhysMin: 50, PhysMax: 100},
 		},
 		AlertRules: []pipeline.AlertRule{
 			{ID: "hr-high", Version: "2026-09-v1", Channel: hr, HighEnabled: true, HighThreshold: 120, TriggerN: 3, RecoverN: 3},
@@ -116,6 +120,16 @@ func main() {
 	for _, e := range events {
 		fmt.Printf("  %s@%s %s->%s value=%.0f rule=%s (%s)\n",
 			e.RuleID, e.Time.Format("15:04:05"), stateName(e.From), stateName(e.To), e.Value, e.RuleVersion, e.Reason)
+	}
+
+	truncs := p.Truncations()
+	fmt.Printf("\nsilence truncations (middle gaps and tail share one cap=%s): %d\n",
+		p.EffectiveSilenceCap(), len(truncs))
+	for _, tr := range truncs {
+		fmt.Printf("  ch=%-11s lastData=%s truncatedAt=%s rule=%s/%s cap=%s cal={scale=%v %s}\n    %s\n",
+			tr.Channel, tr.LastDataTime.Format("15:04:05"), tr.TruncatedAt.Format("15:04:05"),
+			tr.Snapshot.RuleID, tr.Snapshot.RuleVersion, tr.Snapshot.SilenceCap,
+			tr.Snapshot.Cal.Scale, tr.Snapshot.Cal.Unit, tr.Reason)
 	}
 }
 

@@ -4,6 +4,11 @@ import "time"
 
 // QualityRule 定义一个通道的质量判定规则。
 type QualityRule struct {
+	// ID/Version 为质量判定规则的身份与版本，随结论快照输出，
+	// 支持按版本重放、还原历史结论。未配置时为空（仍可正常判定）。
+	ID      string
+	Version string
+	// Channel 该规则适用的通道。
 	Channel ChannelID
 	// ExpectedInterval 为该通道标称采样周期；
 	// 相邻点间隔超过 ExpectedInterval+GapTolerance 即判定中间存在缺失。
@@ -83,46 +88,26 @@ func (c *QualityClassifier) Classify(p AlignedPoint) QualityVerdict {
 // 无前置点时传零值并用 ok=false 标识。
 // 返回该批次结束后应记住的“最后实际点”（points 为空时保持 prev）。
 //
-// 缺失槽时间戳从“上一个实际点 + step”开始，严格早于下一个实际点；
-// 若 step<=0 则使用规则的 ExpectedInterval。缺失只填真正的时间空洞，
-// 不修改实际点，保证后续指标计算不会跨越空洞拼接。
-func (c *QualityClassifier) ClassifyStream(prev AlignedPoint, prevOK bool, points []AlignedPoint, step time.Duration) ([]QualityVerdict, AlignedPoint) {
+// 缺失槽时间戳从“上一个实际点 + step”开始，严格早于下一个实际点，
+// 且不超过“上一个实际点 + cap”（与尾段静默同一上限）：
+// 中途长时间断连再回来留下的空洞同样在 cap 处截断，跨度再大也不会
+// 按原采样密度无限补下去；cap 截断时返回一条截断事实，由编排层
+// 附加配置快照与可读原因。缺失只填真正的时间空洞，不修改实际点，
+// 保证后续指标计算不会跨越空洞拼接。
+func (c *QualityClassifier) ClassifyStream(prev AlignedPoint, prevOK bool, points []AlignedPoint, step, cap time.Duration) ([]QualityVerdict, AlignedPoint, []gapTruncation) {
 	out := make([]QualityVerdict, 0, len(points))
+	var truncs []gapTruncation
 	for _, p := range points {
 		if prevOK {
-			out = append(out, c.fillGap(prev, p, step)...)
+			gap := p.Time.Sub(prev.Time)
+			// 空洞内补点：上限 prev+cap（含截断点槽），且严格早于下一实际点。
+			out = append(out, c.fillMissing(prev, prev.Time.Add(cap), p.Time, step, cap)...)
+			if f := c.truncationFor(prev, gap, cap); f != nil {
+				truncs = append(truncs, *f)
+			}
 		}
 		out = append(out, c.Classify(p))
 		prev, prevOK = p, true
 	}
-	return out, prev
-}
-
-func (c *QualityClassifier) fillGap(prev, next AlignedPoint, step time.Duration) []QualityVerdict {
-	r, ok := c.rules[next.Channel]
-	if !ok {
-		return nil
-	}
-	if step <= 0 {
-		step = r.ExpectedInterval
-	}
-	gap := next.Time.Sub(prev.Time)
-	if gap <= r.ExpectedInterval+r.GapTolerance {
-		return nil
-	}
-	missing := make([]QualityVerdict, 0)
-	for t := prev.Time.Add(step); t.Before(next.Time); t = t.Add(step) {
-		missing = append(missing, QualityVerdict{
-			Device:  next.Device,
-			Channel: next.Channel,
-			Time:    t,
-			Class:   QMissing,
-			Present: false,
-			Unit:    next.Unit,
-			Reasons: []string{"no sample in interval; gap " + gap.String() +
-				" exceeds expected " + r.ExpectedInterval.String() +
-				" + tolerance " + r.GapTolerance.String()},
-		})
-	}
-	return missing
+	return out, prev, truncs
 }

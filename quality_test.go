@@ -42,7 +42,7 @@ func TestMissingFillAndNoGapCrossing(t *testing.T) {
 		qPoint(0, base, 70, FlagOK),
 		qPoint(4, base.Add(4*time.Second), 70, FlagOK), // 中间缺 t=1,2,3
 	}
-	vs, _ := c.ClassifyStream(AlignedPoint{}, false, points, time.Second)
+	vs, _, _ := c.ClassifyStream(AlignedPoint{}, false, points, time.Second, DefaultSilenceCap)
 	if len(vs) != 5 {
 		t.Fatalf("want 5 verdicts (2 real + 3 missing), got %d", len(vs))
 	}
@@ -59,7 +59,7 @@ func TestMissingFillAndNoGapCrossing(t *testing.T) {
 		qPoint(0, base, 70, FlagOK),
 		qPoint(1, base.Add(time.Second-50*time.Millisecond), 70, FlagOK),
 	}
-	if got, _ := c.ClassifyStream(AlignedPoint{}, false, closePoints, time.Second); len(got) != 2 {
+	if got, _, _ := c.ClassifyStream(AlignedPoint{}, false, closePoints, time.Second, DefaultSilenceCap); len(got) != 2 {
 		t.Fatalf("jitter within tolerance must not create missing slots, got %d", len(got))
 	}
 	logf(t, "输入: t=0 与 t=4 两个有效点(间隔4s>1s); 依据: 按 1s 槽在严格空洞处补缺失; 结论: 3 个 QMissing(t=1,2,3), 实际点不变")

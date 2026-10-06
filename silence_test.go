@@ -20,7 +20,7 @@ func silenceConfig(cap time.Duration) Config {
 		},
 		Clocks: map[DeviceID]ClockParams{d1: {}},
 		Quality: []QualityRule{
-			{Channel: hr, ExpectedInterval: time.Second, GapTolerance: 200 * time.Millisecond, PhysMin: 30, PhysMax: 220},
+			{ID: "hr-quality", Version: "q-1", Channel: hr, ExpectedInterval: time.Second, GapTolerance: 200 * time.Millisecond, PhysMin: 30, PhysMax: 220},
 		},
 		AlertRules: []AlertRule{
 			{ID: "hr-high", Version: "cfg-1", Channel: hr, HighEnabled: true, HighThreshold: 120, TriggerN: 2, RecoverN: 2},
@@ -134,7 +134,8 @@ func TestSilenceCapTruncation(t *testing.T) {
 }
 
 // TestSilenceCapConfigurable 上限由使用方配置：改大改小截断位置随之变化，
-// 相同配置重复运行结论逐条一致（可复现）。
+// 相同配置重复运行结论逐条一致（可复现）；未配置（<=0）时不退化为无限补点，
+// 而是采用明确、有限、可复现的 DefaultSilenceCap。
 func TestSilenceCapConfigurable(t *testing.T) {
 	run := func(cap time.Duration) []TailTruncation {
 		cfg := silenceConfig(cap)
@@ -159,15 +160,28 @@ func TestSilenceCapConfigurable(t *testing.T) {
 	if !large[0].TruncatedAt.Equal(epoch.Add(23 * time.Second)) {
 		t.Fatalf("cap=20s must truncate at t3+20s=t23, got %v", large[0].TruncatedAt)
 	}
-	// 不设上限：推进到哪补到哪，不产生截断结论。
-	if uncapped := run(0); len(uncapped) != 0 {
-		t.Fatalf("cap<=0 means no truncation, got %+v", uncapped)
+	// 未配置上限（0）：采用默认有限上限，仍然截断并给出结论，绝不无限补点。
+	def := run(0)
+	if len(def) != 1 {
+		t.Fatalf("missing cap config must still truncate at DefaultSilenceCap, got %+v", def)
 	}
-	// 可复现：相同配置再跑一遍，结论逐条一致。
+	if want := epoch.Add(3*time.Second + DefaultSilenceCap); !def[0].TruncatedAt.Equal(want) {
+		t.Fatalf("unconfigured cap must default to %s -> truncate at %v, got %v",
+			DefaultSilenceCap, want, def[0].TruncatedAt)
+	}
+	if def[0].Snapshot.SilenceCap != DefaultSilenceCap || def[0].Snapshot.RuleID != SilenceRuleID {
+		t.Fatalf("default-cap truncation must pin effective cap and rule identity, got %+v", def[0].Snapshot)
+	}
+	// 负值同样回退到默认上限（明确、有限、可复现）。
+	if neg := run(-1); len(neg) != 1 || !neg[0].TruncatedAt.Equal(def[0].TruncatedAt) {
+		t.Fatalf("negative cap must behave exactly like unconfigured, got %+v", neg)
+	}
+	// 可复现：相同配置再跑一遍，结论逐条一致（含快照）。
 	again := run(5 * time.Second)
 	if len(again) != 1 || again[0] != small[0] {
 		t.Fatalf("same cap must reproduce identical truncation, got %+v vs %+v", again, small)
 	}
-	logf(t, "输入: 同一批 t0-3 后静默的数据, SilenceCap=5s/20s/0; 依据: 截断位置=最后实际点+上限; "+
-		"结论: 5s->t8, 20s->t23, 0->不截断; 同配置重跑结论逐条一致")
+	logf(t, "输入: 同一批 t0-3 后静默的数据, SilenceCap=5s/20s/0/-1, 推进到 +1h; 依据: 截断位置=最后实际点+生效上限, 非正值回退默认 %s; "+
+		"结论: 5s->t8, 20s->t23, 0/-1->默认上限截断(t%s), 均有结论且同配置重跑逐条一致(含快照)",
+		DefaultSilenceCap, def[0].TruncatedAt.Format("15:04:05"))
 }
