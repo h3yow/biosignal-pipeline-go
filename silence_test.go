@@ -44,7 +44,7 @@ func silencePackets(cfg Config) []RawSample {
 // 尾段必须被标成缺失（告警被强制恢复、指标窗在最后实际点关闭），
 // 而不是看起来“一直正常”。
 func TestTailSilenceMarkedMissing(t *testing.T) {
-	cfg := silenceConfig(0) // 不设上限：推进到哪补到哪
+	cfg := silenceConfig(0) // 未配置上限：按 DefaultSilenceCap(5min) 生效，推进 60s 仍在界内
 	p := NewPipeline(cfg)
 	for _, pk := range silencePackets(cfg) {
 		p.Ingest(pk)
@@ -107,8 +107,15 @@ func TestSilenceCapTruncation(t *testing.T) {
 	tr := truncs[0]
 	// 最后数据 t3，上限 10s -> 截断位置 t13。
 	wantAt := cfg.Epoch.Add(13 * time.Second)
+	if tr.Kind != TruncationTail {
+		t.Fatalf("tail silence must yield TruncationTail, got kind=%d", tr.Kind)
+	}
 	if !tr.LastDataTime.Equal(cfg.Epoch.Add(3*time.Second)) || !tr.TruncatedAt.Equal(wantAt) {
 		t.Fatalf("truncation position wrong: %+v (want last=t3 at=%v)", tr, wantAt)
+	}
+	// 截断结论带机器可读快照：当时生效的上限值必须能直接取到。
+	if tr.Snapshot.SilenceCap != 10*time.Second {
+		t.Fatalf("truncation snapshot must pin effective cap 10s, got %+v", tr.Snapshot)
 	}
 	// 不可用段补到截断位置为止，不再向下。
 	ep := p.Episodes()
@@ -133,10 +140,11 @@ func TestSilenceCapTruncation(t *testing.T) {
 		"结论: 截断结论 1 条(最后数据 t3, 截断于 t13), 不可用段止于 t13, 再推进不重复不延伸")
 }
 
-// TestSilenceCapConfigurable 上限由使用方配置：改大改小截断位置随之变化，
+// TestSilenceCapConfigurable 上限由使用方配置：改大改小截断位置随之确定性地变化；
+// 未配置（<=0）时不退化为无边界填充，而是按 DefaultSilenceCap 截断并给出结论；
 // 相同配置重复运行结论逐条一致（可复现）。
 func TestSilenceCapConfigurable(t *testing.T) {
-	run := func(cap time.Duration) []TailTruncation {
+	run := func(cap time.Duration) []SilenceTruncation {
 		cfg := silenceConfig(cap)
 		p := NewPipeline(cfg)
 		for _, pk := range silencePackets(cfg) {
@@ -159,15 +167,27 @@ func TestSilenceCapConfigurable(t *testing.T) {
 	if !large[0].TruncatedAt.Equal(epoch.Add(23 * time.Second)) {
 		t.Fatalf("cap=20s must truncate at t3+20s=t23, got %v", large[0].TruncatedAt)
 	}
-	// 不设上限：推进到哪补到哪，不产生截断结论。
-	if uncapped := run(0); len(uncapped) != 0 {
-		t.Fatalf("cap<=0 means no truncation, got %+v", uncapped)
+	// 未配置上限：不退化为无边界——按 DefaultSilenceCap 截断并给出明确结论，
+	// 快照中记录的是解析后的实际生效值。
+	unset := run(0)
+	if len(unset) != 1 {
+		t.Fatalf("unset cap must fall back to default cap and still conclude, got %+v", unset)
+	}
+	if want := epoch.Add(3*time.Second + DefaultSilenceCap); !unset[0].TruncatedAt.Equal(want) {
+		t.Fatalf("unset cap must truncate at t3+DefaultSilenceCap=%v, got %v", want, unset[0].TruncatedAt)
+	}
+	if unset[0].Snapshot.SilenceCap != DefaultSilenceCap {
+		t.Fatalf("snapshot must record effective default cap %v, got %+v",
+			DefaultSilenceCap, unset[0].Snapshot)
 	}
 	// 可复现：相同配置再跑一遍，结论逐条一致。
 	again := run(5 * time.Second)
-	if len(again) != 1 || again[0] != small[0] {
+	if len(again) != 1 || !again[0].TruncatedAt.Equal(small[0].TruncatedAt) ||
+		!again[0].LastDataTime.Equal(small[0].LastDataTime) || again[0].Kind != small[0].Kind ||
+		again[0].Snapshot != small[0].Snapshot {
 		t.Fatalf("same cap must reproduce identical truncation, got %+v vs %+v", again, small)
 	}
-	logf(t, "输入: 同一批 t0-3 后静默的数据, SilenceCap=5s/20s/0; 依据: 截断位置=最后实际点+上限; "+
-		"结论: 5s->t8, 20s->t23, 0->不截断; 同配置重跑结论逐条一致")
+	logf(t, "输入: 同一批 t0-3 后静默的数据, SilenceCap=5s/20s/未配置; 依据: 截断位置=最后实际点+生效上限(未配置取默认 %v); "+
+		"结论: 5s->t8, 20s->t23, 未配置->t3+%v 且快照记录生效上限; 同配置重跑结论逐条一致",
+		DefaultSilenceCap, DefaultSilenceCap)
 }

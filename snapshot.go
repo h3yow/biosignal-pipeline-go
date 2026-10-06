@@ -23,6 +23,9 @@ type ConfigSnapshot struct {
 	RecoverDuration time.Duration
 	// 产生结论时通道使用的换算参数与量纲。
 	Cal Calibration
+	// SilenceCap 为产生结论时实际生效的静默填充上限
+	// （未配置时取默认上限 DefaultSilenceCap，此处记录解析后的实际值）。
+	SilenceCap time.Duration
 }
 
 // snapshotFromAlertRule 由告警规则与通道校准构建快照。
@@ -44,5 +47,15 @@ func snapshotFromEpisodeRule(r EpisodeRule, cal Calibration) ConfigSnapshot {
 		LowEnabled: r.LowEnabled, LowThreshold: r.LowThreshold,
 		RecoverDuration: r.RecoverDuration,
 		Cal:             cal,
+	}
+}
+
+// snapshotFromQualityRule 由质量规则、通道校准与实际生效的静默上限构建快照，
+// 用于指标窗与静默截断这类“由质量判定流直接产生”的结论。
+func snapshotFromQualityRule(r QualityRule, cal Calibration, cap time.Duration) ConfigSnapshot {
+	return ConfigSnapshot{
+		RuleID: r.ID, RuleVersion: r.Version,
+		Cal:        cal,
+		SilenceCap: cap,
 	}
 }
